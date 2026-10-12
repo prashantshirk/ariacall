@@ -11,6 +11,10 @@ export default defineConfig({
   },
   server: {
     port: 5173,
+    watch: {
+      // Prevent Vite from watching locked OS/app files
+      ignored: ["**/AppData/**", "**/.gemini/**", "**/node_modules/**"],
+    },
     proxy: {
       "/api": {
         target: "http://localhost:8000",
@@ -23,3 +27,4 @@ export default defineConfig({
     },
   },
 })
+
