@@ -1,3 +1,4 @@
+import "dotenv/config"
 import express from "express"
 import cors from "cors"
 import http from "http"
@@ -178,20 +179,23 @@ wss.on("connection", (clientWs) => {
 
   let geminiWs = null
   let isGeminiReady = false
+  const pendingAudio = []
 
   if (GEMINI_API_KEY) {
     // Connect to Gemini Multimodal Live API
-    const geminiUrl = `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1alpha.GenerativeService.BidiGenerateContent?key=${GEMINI_API_KEY}`
+    const LIVE_MODEL = process.env.GEMINI_LIVE_MODEL || "models/gemini-3.8-live"
+    const geminiUrl = `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key=${GEMINI_API_KEY}`
+    console.log("[Gemini Live] Connecting to:", geminiUrl.replace(GEMINI_API_KEY, "***"), "using model:", LIVE_MODEL)
     geminiWs = new WebSocket(geminiUrl)
 
     geminiWs.on("open", () => {
-      console.log("[Gemini Live] Connected to Gemini Multimodal Live API")
-      isGeminiReady = true
+      console.log("[Gemini Live] Connected to Gemini Multimodal Live API, sending setup handshake...")
+      isGeminiReady = false
 
       // Send Setup Handshake
       const setupMessage = {
         setup: {
-          model: "models/gemini-2.0-flash-exp",
+          model: LIVE_MODEL,
           generationConfig: {
             responseModalities: ["AUDIO"],
             speechConfig: {
@@ -202,6 +206,8 @@ wss.on("connection", (clientWs) => {
               },
             },
           },
+          inputAudioTranscription: {},
+          outputAudioTranscription: {},
           systemInstruction: {
             parts: [
               {
@@ -251,30 +257,44 @@ Rules:
         },
       }
       geminiWs.send(JSON.stringify(setupMessage))
-      clientWs.send(JSON.stringify({ type: "state", state: "listening" }))
     })
 
     geminiWs.on("message", (data) => {
       try {
         const msg = JSON.parse(data.toString())
 
+        // 0. Setup Confirmation
+        if (msg.setupComplete) {
+          isGeminiReady = true
+          console.log("[Gemini Live] Setup confirmed by Gemini! Ready for voice interaction.")
+          clientWs.send(JSON.stringify({ type: "state", state: "listening" }))
+          // Mic capture starts before the upstream handshake. Preserve the
+          // opening audio frames instead of silently dropping them.
+          while (pendingAudio.length && geminiWs.readyState === WebSocket.OPEN) {
+            const base64Audio = pendingAudio.shift().toString("base64")
+            geminiWs.send(JSON.stringify({ realtimeInput: { audio: { mimeType: "audio/pcm;rate=16000", data: base64Audio } } }))
+          }
+          // Send greeting trigger so Aria speaks to caller immediately
+          geminiWs.send(
+            JSON.stringify({
+              clientContent: {
+                turns: [
+                  {
+                    role: "user",
+                    parts: [{ text: "Hello Aria, please greet the customer warmly in one brief sentence." }],
+                  },
+                ],
+                turnComplete: true,
+              },
+            })
+          )
+          return
+        }
+
         // 1. Audio and Text from Model
         if (msg.serverContent && msg.serverContent.modelTurn) {
           const parts = msg.serverContent.modelTurn.parts || []
           for (const part of parts) {
-            // Text transcript
-            if (part.text) {
-              turns.push({ speaker: "agent", text: part.text, ts: Date.now(), final: true })
-              clientWs.send(
-                JSON.stringify({
-                  type: "transcript",
-                  speaker: "agent",
-                  text: part.text,
-                  final: true,
-                  ts: Date.now(),
-                })
-              )
-            }
             // Audio PCM16 24kHz binary chunk
             if (part.inlineData && part.inlineData.data) {
               const audioBuffer = Buffer.from(part.inlineData.data, "base64")
@@ -282,6 +302,20 @@ Rules:
               clientWs.send(JSON.stringify({ type: "state", state: "speaking" }))
             }
           }
+        }
+
+        if (msg.serverContent?.interimInputTranscription?.text) {
+          clientWs.send(JSON.stringify({ type: "input_transcript", text: msg.serverContent.interimInputTranscription.text, final: false, ts: Date.now() }))
+        }
+        if (msg.serverContent?.inputTranscription?.text) {
+          const text = msg.serverContent.inputTranscription.text
+          turns.push({ speaker: "customer", text, ts: Date.now(), final: true })
+          clientWs.send(JSON.stringify({ type: "input_transcript", text, final: true, ts: Date.now() }))
+        }
+        if (msg.serverContent?.outputTranscription?.text) {
+          const text = msg.serverContent.outputTranscription.text
+          turns.push({ speaker: "agent", text, ts: Date.now(), final: true })
+          clientWs.send(JSON.stringify({ type: "output_transcript", text, final: true, ts: Date.now() }))
         }
 
         // 2. Interruption / Barge-in
@@ -352,39 +386,93 @@ Rules:
     })
 
     geminiWs.on("error", (err) => {
-      console.error("[Gemini WS] Error:", err)
-      clientWs.send(JSON.stringify({ type: "error", message: "Gemini Live API connection error" }))
+      console.error("[Gemini WS] Error:", err.message || err)
+      clientWs.send(
+        JSON.stringify({
+          type: "error",
+          message: `Gemini Live API error: ${err.message || "connection failed"}. Check GEMINI_API_KEY on Render.`,
+        })
+      )
     })
 
-    geminiWs.on("close", () => {
-      console.log("[Gemini WS] Connection closed")
+    geminiWs.on("unexpected-response", (_req, res) => {
+      let body = ""
+      res.on("data", (chunk) => (body += chunk))
+      res.on("end", () => {
+        console.error("[Gemini WS] Unexpected HTTP response:", res.statusCode, body)
+        clientWs.send(
+          JSON.stringify({
+            type: "error",
+            message: `Gemini API rejected connection (HTTP ${res.statusCode}). Check your API key and quota.`,
+          })
+        )
+      })
+    })
+
+    geminiWs.on("close", (code, reason) => {
+      console.log("[Gemini WS] Connection closed:", code, reason?.toString())
+      isGeminiReady = false
+      if (code !== 1000 && clientWs.readyState === WebSocket.OPEN) {
+        clientWs.send(
+          JSON.stringify({
+            type: "error",
+            message: `Gemini Live disconnected (${code}): ${reason?.toString() || "Connection lost"}`,
+          })
+        )
+      }
     })
   }
+
+  let audioChunkCount = 0
 
   // Handle Incoming from Browser Client
   clientWs.on("message", (data, isBinary) => {
     if (isBinary) {
       // 16 kHz PCM16 chunk from microphone
+      audioChunkCount++
+      if (audioChunkCount % 60 === 1) {
+        console.log(`[Aria WS] Mic audio streaming in: ${audioChunkCount} chunks (Gemini ready: ${isGeminiReady})`)
+      }
+
       if (geminiWs && isGeminiReady && geminiWs.readyState === WebSocket.OPEN) {
         const base64Audio = Buffer.from(data).toString("base64")
         geminiWs.send(
           JSON.stringify({
             realtimeInput: {
-              mediaChunks: [
-                {
-                  mimeType: "audio/pcm;rate=16000",
-                  data: base64Audio,
-                },
-              ],
+              audio: {
+                mimeType: "audio/pcm;rate=16000",
+                data: base64Audio,
+              },
             },
           })
         )
+      } else if (geminiWs && pendingAudio.length < 64) {
+        pendingAudio.push(Buffer.from(data))
       }
     } else {
       try {
         const textMsg = JSON.parse(data.toString())
         if (textMsg.type === "start") {
           clientWs.send(JSON.stringify({ type: "state", state: "listening" }))
+        } else if (textMsg.type === "user_turn" && textMsg.text) {
+          console.log(`[Aria WS] Received user utterance: "${textMsg.text}"`)
+          turns.push({ speaker: "customer", text: textMsg.text, ts: Date.now(), final: true })
+          if (geminiWs && geminiWs.readyState === WebSocket.OPEN) {
+            clientWs.send(JSON.stringify({ type: "state", state: "thinking" }))
+            geminiWs.send(
+              JSON.stringify({
+                clientContent: {
+                  turns: [
+                    {
+                      role: "user",
+                      parts: [{ text: textMsg.text }],
+                    },
+                  ],
+                  turnComplete: true,
+                },
+              })
+            )
+          }
         } else if (textMsg.type === "end") {
           finalizeCall()
         }
@@ -435,7 +523,8 @@ Rules:
     clientWs.send(JSON.stringify({ type: "ended", call_id: callId }))
   }
 
-  clientWs.on("close", () => {
+  clientWs.on("close", (code, reason) => {
+    console.log(`[Aria WS] Client disconnected (${code}): ${reason?.toString() || ""}`)
     if (geminiWs && geminiWs.readyState === WebSocket.OPEN) {
       geminiWs.close()
     }

@@ -2,9 +2,10 @@ import { useRef, useCallback } from "react"
 
 interface UsePcmPlayerProps {
   onLevel?: (level: number) => void
+  onPlaybackEnd?: () => void
 }
 
-export function usePcmPlayer({ onLevel }: UsePcmPlayerProps = {}) {
+export function usePcmPlayer({ onLevel, onPlaybackEnd }: UsePcmPlayerProps = {}) {
   const audioContextRef = useRef<AudioContext | null>(null)
   const analyserRef = useRef<AnalyserNode | null>(null)
   const nextStartTimeRef = useRef<number>(0)
@@ -13,9 +14,8 @@ export function usePcmPlayer({ onLevel }: UsePcmPlayerProps = {}) {
 
   const initContext = useCallback(() => {
     if (!audioContextRef.current || audioContextRef.current.state === "closed") {
-      const ctx = new (window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext)({
-        sampleRate: 24000,
-      })
+      const AudioCtx = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext
+      const ctx = new AudioCtx()
       audioContextRef.current = ctx
 
       const analyser = ctx.createAnalyser()
@@ -72,9 +72,10 @@ export function usePcmPlayer({ onLevel }: UsePcmPlayerProps = {}) {
       activeSourcesRef.current.push(source)
       source.onended = () => {
         activeSourcesRef.current = activeSourcesRef.current.filter((s) => s !== source)
+        if (activeSourcesRef.current.length === 0) onPlaybackEnd?.()
       }
     },
-    [initContext]
+    [initContext, onPlaybackEnd]
   )
 
   // Barge-in flush: stops all scheduled sources immediately

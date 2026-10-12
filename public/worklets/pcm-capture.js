@@ -46,7 +46,9 @@ class PcmCaptureProcessor extends AudioWorkletProcessor {
       // Compute RMS level for this chunk
       let rms = 0;
       if (this.sampleCount > 0) {
-        rms = Math.min(1, Math.sqrt(this.levelAccum / this.sampleCount) * 3);
+        // Keep true RMS in a stable scale; gain multiplication made room noise
+        // look like speech and triggered false barge-ins.
+        rms = Math.min(1, Math.sqrt(this.levelAccum / this.sampleCount));
         this.levelAccum = 0;
         this.sampleCount = 0;
       }

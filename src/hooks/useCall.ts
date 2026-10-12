@@ -41,23 +41,44 @@ export function useCall() {
   const recognitionRef = useRef<any>(null)
   const speechSynthRef = useRef<SpeechSynthesisUtterance | null>(null)
   const mockScriptTimeoutRef = useRef<number[]>([])
+  const speakingRef = useRef(false)
+  const mutedRef = useRef(isMuted)
+  const bargeFramesRef = useRef(0)
+  mutedRef.current = isMuted
 
   // PCM player for agent audio
   const pcmPlayer = usePcmPlayer({
     onLevel: (level) => {
       setAgentLevel(level)
     },
+    onPlaybackEnd: () => {
+      speakingRef.current = false
+      if (useCallStore.getState().state === "speaking") setState("listening")
+    },
   })
 
   // PCM capture for microphone audio
   const micCapture = useMicCapture({
-    onPcmChunk: (chunk) => {
-      if (socketRef.current && socketRef.current.readyState === WebSocket.OPEN && !isMuted) {
+    onPcmChunk: (chunk, rms) => {
+      if (speakingRef.current) {
+        // A few consecutive loud frames are needed to distinguish speech from
+        // keyboard/fan noise. Worklet frames are 30 ms each.
+        bargeFramesRef.current = rms >= 0.035 ? bargeFramesRef.current + 1 : 0
+        if (bargeFramesRef.current >= 5) {
+          pcmPlayer.flush()
+          speakingRef.current = false
+          bargeFramesRef.current = 0
+          setState("listening")
+        }
+      } else {
+        bargeFramesRef.current = 0
+      }
+      if (socketRef.current && socketRef.current.readyState === WebSocket.OPEN && !mutedRef.current) {
         socketRef.current.send(chunk)
       }
     },
     onLevel: (level) => {
-      if (!isMuted) {
+      if (!mutedRef.current) {
         setMicLevel(level)
       } else {
         setMicLevel(0)
@@ -313,19 +334,21 @@ export function useCall() {
         ws.onopen = () => {
           ws.send(JSON.stringify({ type: "start" }))
           setState("listening")
+
         }
 
         ws.onmessage = (event) => {
           if (event.data instanceof ArrayBuffer) {
             // Agent audio PCM16 24kHz
             pcmPlayer.playPcmChunk(event.data)
+            speakingRef.current = true
             setState("speaking")
           } else if (typeof event.data === "string") {
             try {
               const msg = JSON.parse(event.data)
               switch (msg.type) {
                 case "state":
-                  setState(msg.state)
+                  if (msg.state !== "listening" || !speakingRef.current) setState(msg.state)
                   break
                 case "busy":
                   setState("busy")
@@ -338,6 +361,13 @@ export function useCall() {
                   break
                 case "interrupted":
                   pcmPlayer.flush()
+                  speakingRef.current = false
+                  break
+                case "input_transcript":
+                  addOrUpdateTranscript("customer", msg.text, msg.final !== false, msg.ts || Date.now())
+                  break
+                case "output_transcript":
+                  addOrUpdateTranscript("agent", msg.text, msg.final !== false, msg.ts || Date.now())
                   break
                 case "error":
                   setErrorMessage(msg.message)
